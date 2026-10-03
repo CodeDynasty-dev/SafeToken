@@ -5,8 +5,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,9 +13,15 @@ import (
 	"time"
 )
 
+var (
+	errInvalidToken  = errors.New("Invalid token")
+	errTokenExpired  = errors.New("Token expired")
+	errInvalidWindow = errors.New("Invalid time window")
+)
+
 type SafeToken struct {
 	timeWindow map[string]int64
-	secret     string
+	key        []byte
 }
 
 type Config struct {
@@ -26,23 +30,26 @@ type Config struct {
 }
 
 func New(init Config) (*SafeToken, error) {
-	if init.Secret == "" {
-		return nil, errors.New("Please provide safetoken secret")
+	if len(init.Secret) < 12 {
+		return nil, errors.New("Please provide safetoken  secret and time window")
 	}
 
-	timeWindow := make(map[string]int64)
-	if init.TimeWindows != nil {
-		for k, v := range init.TimeWindows {
-			timeWindow[k] = v
+	// Defensive copy so external mutation of init.TimeWindows can't change rules.
+	timeWindow := make(map[string]int64, len(init.TimeWindows))
+	for k, v := range init.TimeWindows {
+		if v <= 0 {
+			return nil, errors.New("Please provide safetoken  secret and time window")
 		}
+		timeWindow[k] = v
 	}
 	if len(timeWindow) == 0 {
-		timeWindow["access"] = 3600000 // 1 hour default (in ms)
+		timeWindow["access"] = 3600000     // 1 hour (ms)
+		timeWindow["refresh"] = 2592000000 // 30 days (ms)
 	}
 
 	return &SafeToken{
 		timeWindow: timeWindow,
-		secret:     init.Secret,
+		key:        []byte(init.Secret),
 	}, nil
 }
 
@@ -50,7 +57,7 @@ func (s *SafeToken) Create(data map[string]any) (string, error) {
 	if data == nil {
 		data = make(map[string]any)
 	}
-	return createHmacSha256Signature(data, s.secret, timestamp())
+	return createHmacSha256Signature(data, s.key, timestamp())
 }
 
 func (s *SafeToken) Verify(token string, timeWindowKeys ...string) (map[string]any, error) {
@@ -61,32 +68,33 @@ func (s *SafeToken) Verify(token string, timeWindowKeys ...string) (map[string]a
 
 	window, ok := s.timeWindow[timeWindowKey]
 	if !ok {
-		return nil, errors.New("Invalid time window")
+		return nil, errInvalidWindow
 	}
 
-	return verifyToken(token, s.secret, window)
+	return verifyToken(token, s.key, window)
 }
 
 func (s *SafeToken) Decode(token string) (map[string]any, error) {
 	parts := strings.Split(token, ".")
-	if len(parts) < 3 || parts[2] == "" {
-		return nil, errors.New("Invalid token")
+	if len(parts) != 3 || parts[2] == "" {
+		return nil, errInvalidToken
 	}
+	return decodePayload(parts[2])
+}
 
-	decodedData, err := base64UrlDecode(parts[2])
+func decodePayload(data string) (map[string]any, error) {
+	decodedData, err := base64UrlDecode(data)
 	if err != nil {
-		return nil, errors.New("Invalid token")
+		return nil, errInvalidToken
 	}
-
 	var payload map[string]any
 	if err := json.Unmarshal(decodedData, &payload); err != nil {
-		return nil, errors.New("Invalid token")
+		return nil, errInvalidToken
 	}
-
 	return payload, nil
 }
 
-func createHmacSha256Signature(payload map[string]any, secret string, t string) (string, error) {
+func createHmacSha256Signature(payload map[string]any, key []byte, t string) (string, error) {
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
@@ -95,86 +103,70 @@ func createHmacSha256Signature(payload map[string]any, secret string, t string) 
 	tbuf := base64UrlEncode([]byte(t))
 	dataToSign := base64UrlEncode(payloadBytes)
 
-	h := hmac.New(sha256.New, []byte(secret))
+	h := hmac.New(sha256.New, key)
 	h.Write([]byte(dataToSign + tbuf))
-	signatureBuffer := h.Sum(nil)
 
-	signature := base64UrlEncode(signatureBuffer)
-	return fmt.Sprintf("%s.%s.%s", t, signature, dataToSign), nil
+	signature := base64UrlEncode(h.Sum(nil))
+	return t + "." + signature + "." + dataToSign, nil
 }
 
-func verifyToken(token string, secret string, timeWindow int64) (map[string]any, error) {
+func verifyToken(token string, key []byte, timeWindow int64) (map[string]any, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return nil, errors.New("Invalid token")
+		return nil, errInvalidToken
 	}
 
-	t := parts[0]
-	signature := parts[1]
-	data := parts[2]
-
-	if t == "" || signature == "" || data == "" {
-		return nil, errors.New("Invalid token")
+	t, signature, data := parts[0], parts[1], parts[2]
+	if signature == "" || data == "" || !isHex8(t) {
+		return nil, errInvalidToken
 	}
 
-	inTime, err := isIntime(timeWindow, t)
-	if err != nil {
-		return nil, err
-	}
-	if !inTime {
-		return nil, errors.New("Token expired")
+	if !isInTime(timeWindow, t) {
+		return nil, errTokenExpired
 	}
 
-	timeBase64 := base64UrlEncode([]byte(t))
-	dataToSign := data + timeBase64
+	h := hmac.New(sha256.New, key)
+	h.Write([]byte(data + base64UrlEncode([]byte(t))))
+	expectedSignature := base64UrlEncode(h.Sum(nil))
 
-	h := hmac.New(sha256.New, []byte(secret))
-	h.Write([]byte(dataToSign))
-	signatureBuffer := h.Sum(nil)
-
-	expectedSignature := base64UrlEncode(signatureBuffer)
-
-	if timingSafeEqual(signature, expectedSignature) {
-		decodedData, err := base64UrlDecode(data)
-		if err != nil {
-			return nil, errors.New("Invalid token")
-		}
-		var payload map[string]any
-		if err := json.Unmarshal(decodedData, &payload); err != nil {
-			return nil, errors.New("Invalid token")
-		}
-		return payload, nil
+	if !timingSafeEqual(signature, expectedSignature) {
+		return nil, errInvalidToken
 	}
-
-	return nil, errors.New("Invalid token")
+	return decodePayload(data)
 }
 
-func isIntime(timeWindow int64, lastTime string) (bool, error) {
-	if timeWindow <= 0 {
-		return false, errors.New("Invalid time window")
+// isHex8 matches /^[0-9a-fA-F]{8}$/ without regexp overhead.
+func isHex8(s string) bool {
+	if len(s) != 8 {
+		return false
 	}
-	lastTimeParsed, err := strconv.ParseInt(lastTime, 16, 64)
-	if err != nil {
-		return false, nil
+	for i := 0; i < 8; i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func isInTime(timeWindow int64, timeCreated string) bool {
+	// timeWindow > 0 is guaranteed by New().
+	timeCreatedParsed, err := strconv.ParseInt(timeCreated, 16, 64)
+	if err != nil || timeCreatedParsed <= 0 {
+		return false
 	}
 
-	nowMs := time.Now().UnixMilli()
-	tokenMs := lastTimeParsed * 1000
+	diff := time.Now().UnixMilli() - timeCreatedParsed*1000
 
-	// Protect against future-dated token attack (allow up to 5s clock skew)
-	diff := nowMs - tokenMs
+	// Protect against future-dated token timestamp exploit (allow up to 5s clock skew)
 	if diff < -5000 {
-		return false, nil
+		return false
 	}
-
-	return diff <= timeWindow, nil
+	return diff <= timeWindow
 }
 
 func timestamp() string {
-	t := uint32(time.Now().Unix())
-	buffer := make([]byte, 4)
-	binary.BigEndian.PutUint32(buffer, t)
-	return hex.EncodeToString(buffer)
+	return fmt.Sprintf("%08x", uint32(time.Now().Unix()))
 }
 
 func timingSafeEqual(a, b string) bool {
