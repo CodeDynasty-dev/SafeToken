@@ -58,6 +58,13 @@ Avoid it when:
 
 - You need features like `audience` (`aud`) or `issuer` (`iss`) checks out of the box (you'd have to build these yourself).
 
+## next Considerations
+
+SafeToken was intentionally kept minimal and lightweight (~150 lines). currently there are few limitations for using SafeToken
+
+- Payloads currently rely on standard string base64 encoding. Storing emojis (e.g. `🚀`), CJK, Arabic, or multi-byte Unicode characters in payloads can trigger encoding errors. Stick to standard ASCII/Latin-1 alphanumeric data (user IDs, emails, roles).
+- Changing your secret invalidates all active tokens at once, ni version tag.
+
 ## Usage
 
 ```js

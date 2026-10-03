@@ -1,57 +1,75 @@
 export class SafeToken<
-  TimeWindow extends Record<string, number> = { access: number }
+  TimeWindow extends Record<string, number> = { "access": number, "refresh": number }
 > {
-  private timeWindow: TimeWindow;
-  private secret: string;
+  readonly #timeWindow: TimeWindow;
+  readonly #secret: string;
+  readonly #enc: TextEncoder;
+  readonly #keyPromise: Promise<CryptoKey> | CryptoKey;
 
   constructor(init: { timeWindows?: TimeWindow; secret: string }) {
-    if (!init.secret) {
-      throw new Error("Please provide safetoken secret");
+    if (!init || !init.secret || init.secret.length < 12 || (Object.keys(init.timeWindows || {}).length && Object.values(init.timeWindows!)
+      .some((w) => (typeof w !== 'number' || w <= 0 || w === undefined || w === null || !Number.isFinite(w) || Number.isNaN(w))))) {
+      throw new Error("Please provide safetoken  secret and time window");
     }
-    this.secret = init.secret;
-    this.timeWindow =
-      init.timeWindows ||
-      ({ access: 3600000 /* 1 hour */ } as unknown as TimeWindow); // Default time window
+    this.#secret = init.secret;
+    this.#timeWindow = init.timeWindows || { "access": 3600000, "refresh": 2592000000 } as unknown as TimeWindow
+    this.#enc = new TextEncoder();
+    this.#keyPromise = crypto.subtle.importKey(
+      "raw",
+      this.#enc.encode(this.#secret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign", "verify"]
+    );
   }
 
   async create(data: Record<string, string | number | boolean> = {}) {
-    return await createHmacSha256Signature(data, this.secret, timestamp());
+    const key = await this.#keyPromise;
+    return await createHmacSha256Signature(data, key, this.#enc, timestamp());
   }
 
   async verify(token: string, timeWindowKey: keyof TimeWindow = "access") {
     if (typeof token === "string") {
+      const key = await this.#keyPromise;
+      if (!this.#timeWindow[timeWindowKey]) throw new Error("Invalid time window");
       return await verifyToken(
         token,
-        this.secret,
-        this.timeWindow[timeWindowKey]
+        key,
+        this.#enc,
+        this.#timeWindow[timeWindowKey]
       );
     }
+    console.log({ token });
     throw new Error("Invalid token");
   }
 
-  decode(token: string) {
-    const data = token.split(".")[2];
-    if (!data) {
-      throw new Error("Invalid token");
+  decode(token: string): Record<string, string | number | boolean> {
+    if (typeof token === "string") {
+      const data = token.split(".")[2];
+      if (!data) {
+        console.log({ token });
+        throw new Error("Invalid token");
+      }
+      try {
+        const decodedData = base64UrlDecode(data);
+        return JSON.parse(decodedData);
+      } catch (error) {
+        console.log({ token });
+        throw new Error("Invalid token");
+      }
     }
-    const decodedData = base64UrlDecode(data);
-    return JSON.parse(decodedData);
+    console.log({ token });
+    throw new Error("Invalid token");
   }
 }
 
 async function createHmacSha256Signature(
   payload: Record<string, string | number | boolean>,
-  secret: string,
+  key: CryptoKey,
+  enc: TextEncoder,
   time: string
 ) {
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
+
 
   const tbuf = base64UrlEncode(time);
   const dataToSign = base64UrlEncode(JSON.stringify(payload));
@@ -67,23 +85,15 @@ async function createHmacSha256Signature(
   return `${time}.${signature}.${data}`;
 }
 
-async function verifyToken(token: string, secret: string, timeWindow: number) {
+async function verifyToken(token: string, key: CryptoKey, enc: TextEncoder, timeWindow: number) {
   const [time, signature, data] = token.split(".");
-  if (!isIntime(timeWindow, time)) {
-    throw new Error("Token expired");
-  }
-  if (!time || !signature || !data) {
+  if (!time || !signature || !data || !/^[0-9a-fA-F]{8}$/.test(time)) {
+    console.log({ token });
     throw new Error("Invalid token");
   }
-
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign", "verify"]
-  );
+  if (!isInTime(timeWindow, time)) {
+    throw new Error("Token expired");
+  }
 
   const timeBase64 = base64UrlEncode(time);
   const dataToSign = data + timeBase64;
@@ -100,19 +110,20 @@ async function verifyToken(token: string, secret: string, timeWindow: number) {
     const decodedData = base64UrlDecode(data);
     return JSON.parse(decodedData) as Record<string, string | number | boolean>;
   }
+  console.log({ token });
   throw new Error("Invalid token");
 }
 
-const isIntime = (timeWindow: number, lastTime: string): boolean => {
-  if (timeWindow === undefined || timeWindow === null || timeWindow <= 0) {
-    throw new Error("Invalid time window");
-  }
-  const lastTimeParsed = parseInt(lastTime, 16);
-  if (isNaN(lastTimeParsed)) {
+const isInTime = (timeWindow: number, timeCreated: string): boolean => {
+  // if (timeWindow === undefined || timeWindow === null || timeWindow <= 0) {
+  //   throw new Error("Invalid time window");
+  // } // handled by constructor so won't happen
+  const timeCreatedParsed = parseInt(timeCreated, 16);
+  if (typeof timeCreatedParsed !== "number" || !Number.isFinite(timeCreatedParsed) || timeCreatedParsed <= 0) {
     return false;
   }
   const nowMs = Date.now();
-  const tokenMs = lastTimeParsed * 1000;
+  const tokenMs = timeCreatedParsed * 1000;
   const diff = nowMs - tokenMs;
 
   // Protect against future-dated token timestamp exploit (allow up to 5s clock skew)
@@ -124,19 +135,11 @@ const isIntime = (timeWindow: number, lastTime: string): boolean => {
 };
 
 const timestamp = (): string => {
-  const time = Math.floor(Date.now() / 1000);
-  const buffer = new Uint8Array(4);
-  buffer[3] = time & 0xff;
-  buffer[2] = (time >> 8) & 0xff;
-  buffer[1] = (time >> 16) & 0xff;
-  buffer[0] = (time >> 24) & 0xff;
-  return Array.from(buffer)
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
+  return (Math.floor(Date.now() / 1000) >>> 0).toString(16).padStart(8, "0");
 };
 
 function timingSafeEqual(a: string, b: string): boolean {
-  if (a?.length !== b.length) {
+  if (a.length !== b.length) {
     return false;
   }
   let result = 0;
