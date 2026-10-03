@@ -63,7 +63,8 @@ Avoid it when:
 SafeToken was intentionally kept minimal and lightweight (~150 lines). currently there are few limitations for using SafeToken
 
 - Payloads currently rely on standard string base64 encoding. Storing emojis (e.g. `🚀`), CJK, Arabic, or multi-byte Unicode characters in payloads can trigger encoding errors. Stick to standard ASCII/Latin-1 alphanumeric data (user IDs, emails, roles).
-- Changing your secret invalidates all active tokens at once, ni version tag.
+- Changing your secret invalidates all active tokens at once, no version tag.
+- `decode()` intentionally bypasses cryptographic verification for lightweight inspection; never use it for authorization decisions.
 
 ## Usage
 
@@ -85,16 +86,23 @@ console.log({
 
 ## Verifying a Token
 
+Validates the cryptographic HMAC-SHA256 signature and verifies that the token has not expired:
+
 ```js
 console.log({
   decodedToken: await Auth.verify(token),
 });
+```
+
+## Decoding a Token (Unverified)
 
 //? only decode doesn't verify
 console.log({
-  decodedToken: await Auth.decode(token),
+  decodedToken: Auth.decode(token),
 });
 ```
+
+**ALWAYS** use `await Auth.verify(token)` for security-sensitive flows.
 
 ## Custom Token Lifetimes Example
 
